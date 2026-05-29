@@ -50,10 +50,10 @@ AI_KEYWORDS = (
     "microsoft copilot",
     "hugging face",
     "sora",
-    "机器人",
-    "人工智能",
-    "大模型",
-    "智能体",
+    "鏈哄櫒浜?",
+    "浜哄伐鏅鸿兘",
+    "澶фā鍨?",
+    "鏅鸿兘浣?",
 )
 
 
@@ -70,6 +70,7 @@ class NewsItem:
     source: str
     published: datetime | None
     summary: str
+    image_url: str = ""
 
 
 def utc_now() -> datetime:
@@ -163,6 +164,32 @@ def first_link(element: ET.Element) -> str:
     return ""
 
 
+def tag_name(element: ET.Element) -> str:
+    return element.tag.rsplit("}", 1)[-1].lower()
+
+
+def absolute_url(url: str, base_url: str) -> str:
+    if not url:
+        return ""
+    return urllib.parse.urljoin(base_url, html.unescape(url.strip()))
+
+
+def first_image_url(element: ET.Element, base_url: str) -> str:
+    for child in element.iter():
+        tag = tag_name(child)
+        attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in child.attrib.items()}
+        if tag in {"content", "thumbnail"} and attrs.get("url"):
+            return absolute_url(attrs["url"], base_url)
+        if tag == "enclosure" and attrs.get("url", "").lower().startswith(("http://", "https://")):
+            if attrs.get("type", "").lower().startswith("image/"):
+                return absolute_url(attrs["url"], base_url)
+    text = ET.tostring(element, encoding="unicode", method="xml")
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', text, flags=re.IGNORECASE)
+    if match:
+        return absolute_url(match.group(1), base_url)
+    return ""
+
+
 def parse_feed(xml_text: str, source: Source) -> list[NewsItem]:
     root = ET.fromstring(xml_text)
     root_tag = root.tag.rsplit("}", 1)[-1].lower()
@@ -186,6 +213,7 @@ def parse_feed(xml_text: str, source: Source) -> list[NewsItem]:
             first_text(node, ("summary", "description", "content", "encoded")),
             limit=220,
         )
+        image_url = first_image_url(node, link)
         if title and link:
             entries.append(
                 NewsItem(
@@ -194,6 +222,7 @@ def parse_feed(xml_text: str, source: Source) -> list[NewsItem]:
                     source=source.name,
                     published=parse_date(published_raw),
                     summary=summary,
+                    image_url=image_url,
                 )
             )
     return entries
@@ -267,57 +296,320 @@ def collect_news(sources: list[Source], lookback_hours: int, max_items: int, sen
     return ranked[:max_items], errors
 
 
+def extract_meta_image(html_text: str, base_url: str) -> str:
+    patterns = (
+        r'<meta[^>]+(?:property|name)=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+(?:property|name)=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']twitter:image(?::src)?["\']',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html_text, flags=re.IGNORECASE)
+        if match:
+            return absolute_url(match.group(1), base_url)
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE)
+    if match:
+        return absolute_url(match.group(1), base_url)
+    return ""
+
+
+def enrich_news_images(items: list[NewsItem]) -> list[NewsItem]:
+    enriched = []
+    for item in items:
+        image_url = item.image_url
+        if not image_url:
+            try:
+                image_url = extract_meta_image(fetch_text(item.link, timeout=12), item.link)
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
+                print(f"Image lookup skipped for {item.link}: {exc}", file=sys.stderr)
+        enriched.append(
+            NewsItem(
+                title=item.title,
+                link=item.link,
+                source=item.source,
+                published=item.published,
+                summary=item.summary,
+                image_url=image_url,
+            )
+        )
+    return enriched
+
+
+def is_probably_chinese(text: str) -> bool:
+    if not text:
+        return False
+    chinese_chars = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    return chinese_chars >= 4
+
+
+def extract_response_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [extract_response_text(item) for item in value]
+        return "".join(part for part in parts if part)
+    if isinstance(value, dict):
+        if isinstance(value.get("output_text"), str):
+            return value["output_text"]
+        if value.get("type") == "output_text" and isinstance(value.get("text"), str):
+            return value["text"]
+        for key in ("text", "content", "output"):
+            extracted = extract_response_text(value.get(key))
+            if extracted:
+                return extracted
+    return ""
+
+
+def translate_summaries_with_openai(items: list[NewsItem]) -> list[NewsItem]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return items
+
+    targets = [
+        (index, item)
+        for index, item in enumerate(items)
+        if item.summary and not is_probably_chinese(item.summary)
+    ]
+    if not targets:
+        return items
+
+    payload_items = [
+        {
+            "index": index,
+            "title": item.title,
+            "summary": item.summary,
+        }
+        for index, item in targets
+    ]
+    prompt = (
+        "鎶婁笅闈? AI 璧勮鎽樿缈昏瘧鎴愮畝浣撲腑鏂囥?傝姹傦細蹇犲疄銆佺畝娲併?侀?傚悎椋炰功鏃ユ姤锛?"
+        "淇濈暀浜у搧鍚嶃?佸叕鍙稿悕鍜屾ā鍨嬪悕锛涗笉瑕佹坊鍔犲師鏂囨病鏈夌殑淇℃伅銆?"
+        "鍙繑鍥? JSON 鏁扮粍锛屾瘡椤规牸寮忎负 {\"index\": 鏁板瓧, \"summary_zh\": \"涓枃鎽樿\"}銆俓n\n"
+        + json.dumps(payload_items, ensure_ascii=False)
+    )
+    model = os.getenv("OPENAI_TRANSLATION_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1-mini"
+    body = {
+        "model": model,
+        "input": prompt,
+        "temperature": 0.2,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            result = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        print(f"OpenAI summary translation skipped: {exc}", file=sys.stderr)
+        return items
+
+    raw_text = extract_response_text(result).strip()
+    raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    try:
+        translations = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        print(f"OpenAI summary translation returned non-JSON text: {exc}", file=sys.stderr)
+        return items
+
+    by_index = {}
+    if isinstance(translations, list):
+        for entry in translations:
+            if isinstance(entry, dict) and isinstance(entry.get("summary_zh"), str):
+                by_index[int(entry.get("index", -1))] = clean_text(entry["summary_zh"], limit=220)
+
+    translated = []
+    for index, item in enumerate(items):
+        summary = by_index.get(index, item.summary)
+        translated.append(
+            NewsItem(
+                title=item.title,
+                link=item.link,
+                source=item.source,
+                published=item.published,
+                summary=summary,
+                image_url=item.image_url,
+            )
+        )
+    return translated
+
+
 def local_date_label() -> str:
     local = datetime.now().astimezone()
     return local.strftime("%Y-%m-%d")
 
 
 def build_digest_text(items: list[NewsItem], errors: list[str]) -> str:
-    lines = [f"每日 AI 资讯｜{local_date_label()}", ""]
+    lines = [f"姣忔棩 AI 璧勮锝渰local_date_label()}", ""]
     if not items:
-        lines.append("今天没有抓取到新的 AI 资讯。")
+        lines.append("浠婂ぉ娌℃湁鎶撳彇鍒版柊鐨? AI 璧勮銆?")
     for index, item in enumerate(items, start=1):
-        date = item.published.astimezone().strftime("%m-%d %H:%M") if item.published else "时间未知"
+        date = item.published.astimezone().strftime("%m-%d %H:%M") if item.published else "鏃堕棿鏈煡"
         lines.append(f"{index}. {item.title}")
-        lines.append(f"   来源：{item.source}｜{date}")
+        lines.append(f"   鏉ユ簮锛歿item.source}锝渰date}")
         if item.summary:
-            lines.append(f"   摘要：{item.summary}")
-        lines.append(f"   链接：{item.link}")
+            lines.append(f"   鎽樿锛歿item.summary}")
+        if item.image_url:
+            lines.append(f"   閰嶅浘锛歿item.image_url}")
+        lines.append(f"   閾炬帴锛歿item.link}")
         lines.append("")
     if errors:
-        lines.append("部分来源抓取失败：")
+        lines.append("閮ㄥ垎鏉ユ簮鎶撳彇澶辫触锛?")
         lines.extend(f"- {error}" for error in errors[:5])
     return "\n".join(lines).strip()
 
 
-def build_feishu_post(items: list[NewsItem], errors: list[str]) -> dict:
+def build_feishu_post(items: list[NewsItem], errors: list[str], image_keys: dict[str, str] | None = None) -> dict:
+    image_keys = image_keys or {}
     content = []
     if not items:
-        content.append([{"tag": "text", "text": "今天没有抓取到新的 AI 资讯。"}])
+        content.append([{"tag": "text", "text": "浠婂ぉ娌℃湁鎶撳彇鍒版柊鐨? AI 璧勮銆?"}])
     for index, item in enumerate(items, start=1):
-        date = item.published.astimezone().strftime("%m-%d %H:%M") if item.published else "时间未知"
+        date = item.published.astimezone().strftime("%m-%d %H:%M") if item.published else "鏃堕棿鏈煡"
         line = [
             {"tag": "text", "text": f"{index}. "},
             {"tag": "a", "text": item.title, "href": item.link},
-            {"tag": "text", "text": f"\n来源：{item.source}｜{date}"},
+            {"tag": "text", "text": f"\n鏉ユ簮锛歿item.source}锝渰date}"},
         ]
         content.append(line)
         if item.summary:
-            content.append([{"tag": "text", "text": f"摘要：{item.summary}"}])
+            content.append([{"tag": "text", "text": f"鎽樿锛歿item.summary}"}])
+        image_key = image_keys.get(item.link)
+        if image_key:
+            content.append([{"tag": "img", "image_key": image_key}])
+        elif item.image_url:
+            content.append(
+                [
+                    {"tag": "text", "text": "閰嶅浘锛?"},
+                    {"tag": "a", "text": "鎵撳紑鍥剧墖", "href": item.image_url},
+                ]
+            )
     if errors:
-        content.append([{"tag": "text", "text": "部分来源抓取失败：" + "；".join(errors[:5])}])
+        content.append([{"tag": "text", "text": "閮ㄥ垎鏉ユ簮鎶撳彇澶辫触锛?" + "锛?".join(errors[:5])}])
 
     return {
         "msg_type": "post",
         "content": {
             "post": {
                 "zh_cn": {
-                    "title": f"每日 AI 资讯｜{local_date_label()}",
+                    "title": f"姣忔棩 AI 璧勮锝渰local_date_label()}",
                     "content": content,
                 }
             }
         },
     }
+
+
+def fetch_binary(url: str, timeout: int = 20, max_bytes: int = 10 * 1024 * 1024) -> tuple[bytes, str]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "daily-ai-news-feishu/1.0 (+https://open.feishu.cn)",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        content_type = response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+        data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"image is larger than {max_bytes} bytes")
+        return data, content_type
+
+
+def get_feishu_tenant_access_token(app_id: str, app_secret: str) -> str:
+    body = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode("utf-8")
+    request = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8", errors="replace"))
+    token = result.get("tenant_access_token")
+    if not token:
+        raise RuntimeError(f"failed to get Feishu tenant token: {result}")
+    return token
+
+
+def multipart_form_data(fields: dict[str, str], files: dict[str, tuple[str, str, bytes]]) -> tuple[bytes, str]:
+    boundary = f"----daily-ai-news-{int(time.time() * 1000)}"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        chunks.append(value.encode("utf-8"))
+        chunks.append(b"\r\n")
+    for name, (filename, content_type, data) in files.items():
+        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+        chunks.append(
+            (
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        chunks.append(data)
+        chunks.append(b"\r\n")
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_feishu_image(token: str, image_url: str) -> str:
+    image_data, content_type = fetch_binary(image_url)
+    extension = {
+        "image/jpeg": "jpg",
+        "image/png": "png",
+        "image/gif": "gif",
+        "image/webp": "webp",
+    }.get(content_type, "jpg")
+    body, content_type_header = multipart_form_data(
+        {"image_type": "message"},
+        {"image": (f"news-image.{extension}", content_type, image_data)},
+    )
+    request = urllib.request.Request(
+        "https://open.feishu.cn/open-apis/im/v1/images",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type_header,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8", errors="replace"))
+    image_key = result.get("data", {}).get("image_key")
+    if not image_key:
+        raise RuntimeError(f"failed to upload Feishu image: {result}")
+    return image_key
+
+
+def upload_news_images_to_feishu(items: list[NewsItem]) -> dict[str, str]:
+    app_id = os.getenv("FEISHU_APP_ID")
+    app_secret = os.getenv("FEISHU_APP_SECRET")
+    if not app_id or not app_secret:
+        return {}
+
+    try:
+        token = get_feishu_tenant_access_token(app_id, app_secret)
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"Feishu image upload disabled: {exc}", file=sys.stderr)
+        return {}
+
+    image_keys = {}
+    for item in items:
+        if not item.image_url:
+            continue
+        try:
+            image_keys[item.link] = upload_feishu_image(token, item.image_url)
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            print(f"Feishu image upload skipped for {item.image_url}: {exc}", file=sys.stderr)
+    return image_keys
 
 
 def sign_payload(payload: dict, secret: str | None) -> dict:
@@ -369,6 +661,8 @@ def main() -> int:
     state_file = Path(args.state)
     sent_links = set() if args.ignore_state else load_sent_links(state_file)
     items, errors = collect_news(sources, args.lookback_hours, args.max_items, sent_links)
+    items = enrich_news_images(items)
+    items = translate_summaries_with_openai(items)
 
     if args.dry_run:
         print(build_digest_text(items, errors))
@@ -379,7 +673,8 @@ def main() -> int:
         print("FEISHU_WEBHOOK_URL is required. Run with --dry-run to preview without sending.", file=sys.stderr)
         return 2
 
-    payload = build_feishu_post(items, errors)
+    image_keys = upload_news_images_to_feishu(items)
+    payload = build_feishu_post(items, errors, image_keys)
     payload = sign_payload(payload, os.getenv("FEISHU_WEBHOOK_SECRET"))
     post_to_feishu(webhook_url, payload)
 
@@ -392,4 +687,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
