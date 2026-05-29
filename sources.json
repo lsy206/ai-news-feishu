@@ -8,16 +8,12 @@
     "url": "https://blog.google/technology/ai/rss/"
   },
   {
-    "name": "Anthropic News",
-    "url": "https://www.anthropic.com/news/rss.xml"
-  },
-  {
     "name": "Microsoft AI Blog",
     "url": "https://blogs.microsoft.com/ai/feed/"
   },
   {
-    "name": "Meta AI Blog",
-    "url": "https://ai.meta.com/blog/rss/"
+    "name": "Meta Engineering",
+    "url": "https://engineering.fb.com/feed/"
   },
   {
     "name": "Hugging Face Blog",
@@ -32,4 +28,3 @@
     "url": "https://venturebeat.com/category/ai/feed/"
   }
 ]
-
