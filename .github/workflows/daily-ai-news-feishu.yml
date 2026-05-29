@@ -1,0 +1,36 @@
+name: Daily AI News to Feishu
+
+on:
+  schedule:
+    # 09:00 Asia/Shanghai. GitHub Actions cron uses UTC.
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Push digest to Feishu
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_TRANSLATION_MODEL: ${{ secrets.OPENAI_TRANSLATION_MODEL }}
+          AI_NEWS_MAX_ITEMS: "10"
+          AI_NEWS_LOOKBACK_HOURS: "72"
+        run: python ai_news_feishu.py --ignore-state
