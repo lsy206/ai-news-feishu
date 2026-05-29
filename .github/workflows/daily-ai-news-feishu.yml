@@ -1,1 +1,31 @@
-D:\ai-news-feishu\.github\workflows\daily-ai-news-feishu.yml
+name: Daily AI News to Feishu
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Push digest to Feishu
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          AI_NEWS_MAX_ITEMS: "12"
+          AI_NEWS_LOOKBACK_HOURS: "24"
+        run: python ai_news_feishu.py --ignore-state
